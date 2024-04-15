@@ -1,13 +1,15 @@
-import { OPFSWorkerAccessHandle, createOPFSAccess } from './access-worker';
-import { getFSHandle, joinPath, parsePath, remove } from './common';
-import { OPFSDirWrap, dir } from './directory';
+import { createOPFSAccess } from './access-worker';
+import { dir, OPFSDirectoryWrap } from './directory';
+import { getFileSystemHandle, joinPath, remove, splitFilePath } from './utils';
+
+import type { OPFSWorkerAccessHandle } from './access-worker';
 
 const fileCache = new Map<string, OPFSFileWrap>();
 /**
  * Retrieves a file wrapper instance for the specified file path.
  * @param {string} filePath - The path of the file.
  * return A file wrapper instance.
- * 
+ *
  * @example
  * // Read content from a file
   const fileContent = await file('/path/to/file.txt').text();
@@ -21,6 +23,7 @@ const fileCache = new Map<string, OPFSFileWrap>();
   await file('/path/to/file.txt').remove();
  */
 export function file(filePath: string) {
+  // const f = fileCache.get(filePath) ?? new OPFSFileWrap(filePath);
   const f = fileCache.get(filePath) ?? new OPFSFileWrap(filePath);
   fileCache.set(filePath, f);
   return f;
@@ -31,7 +34,7 @@ export function file(filePath: string) {
  * @param {string} filePath - The path of the file.
  * @param {string | BufferSource | ReadableStream<BufferSource>} content - The content to write to the file.
  * return A promise that resolves when the content is written to the file.
- * 
+ *
  * @example
  * // Write content to a file
    await write('/path/to/file.txt', 'Hello, world!');
@@ -91,9 +94,9 @@ export class OPFSFileWrap {
 
   constructor(filePath: string) {
     this.#path = filePath;
-    const { parent, name } = parsePath(filePath);
-    this.#name = name;
-    this.#parentPath = parent;
+    const { parentPath, fileName } = splitFilePath(filePath);
+    this.#name = fileName;
+    this.#parentPath = parentPath;
   }
 
   #getAccessHandle = (() => {
@@ -104,16 +107,12 @@ export class OPFSFileWrap {
 
     return () => {
       referCnt += 1;
-      if (accPromise != null) return accPromise;
-
+      if (accPromise != null) {
+        return accPromise;
+      }
       return (accPromise = new Promise(async (resolve, reject) => {
         try {
-          const fh = (await getFSHandle(this.#path, {
-            create: true,
-            isFile: true,
-          })) as FileSystemFileHandle;
-
-          const accHandle = await createOPFSAccess(this.#path, fh);
+          const accHandle = await createOPFSAccess(this.#path);
           resolve([
             accHandle,
             async () => {
@@ -136,7 +135,7 @@ export class OPFSFileWrap {
    * Random write to file
    */
   async createWriter() {
-    if (this.#writing) throw Error('Other writer have not been closed');
+    if (this.#writing) throw new Error('Other writer have not been closed');
     this.#writing = true;
 
     const txtEC = new TextEncoder();
@@ -150,7 +149,7 @@ export class OPFSFileWrap {
         chunk: string | BufferSource,
         opts: { at?: number } = {}
       ) => {
-        if (closed) throw Error('Writer is closed');
+        if (closed) throw new Error('Writer is closed');
         const content = typeof chunk === 'string' ? txtEC.encode(chunk) : chunk;
         const at = opts.at ?? pos;
         const contentSize = content.byteLength;
@@ -158,16 +157,16 @@ export class OPFSFileWrap {
         pos = at + contentSize;
       },
       truncate: async (size: number) => {
-        if (closed) throw Error('Writer is closed');
+        if (closed) throw new Error('Writer is closed');
         await accHandle.truncate(size);
         if (pos > size) pos = size;
       },
       flush: async () => {
-        if (closed) throw Error('Writer is closed');
+        if (closed) throw new Error('Writer is closed');
         await accHandle.flush();
       },
       close: async () => {
-        if (closed) throw Error('Writer is closed');
+        if (closed) throw new Error('Writer is closed');
         closed = true;
         this.#writing = false;
         await unref();
@@ -185,18 +184,18 @@ export class OPFSFileWrap {
     let pos = 0;
     return {
       read: async (size: number, opts: { at?: number } = {}) => {
-        if (closed) throw Error('Reader is closed');
+        if (closed) throw new Error('Reader is closed');
         const offset = opts.at ?? pos;
         const buf = await accHandle.read(offset, size);
         pos = offset + buf.byteLength;
         return buf;
       },
       getSize: async () => {
-        if (closed) throw Error('Reader is closed');
+        if (closed) throw new Error('Reader is closed');
         return await accHandle.getSize();
       },
       close: async () => {
-        if (closed) throw Error('Reader is closed');
+        if (closed) throw new Error('Reader is closed');
         closed = true;
         await unref();
       },
@@ -242,7 +241,7 @@ export class OPFSFileWrap {
 
   async exists() {
     return (
-      (await getFSHandle(this.#path, {
+      (await getFileSystemHandle(this.#path, {
         create: false,
         isFile: true,
       })) instanceof FileSystemFileHandle
@@ -258,9 +257,11 @@ export class OPFSFileWrap {
    * If the target is a file, use current overwrite the target;
    * if the target is a folder, copy the current file into that folder.
    */
-  async copyTo(target: OPFSDirWrap | OPFSFileWrap): Promise<OPFSFileWrap> {
+  async copyTo(
+    target: OPFSDirectoryWrap | OPFSFileWrap
+  ): Promise<OPFSFileWrap> {
     if (!(await this.exists())) {
-      throw Error(`file ${this.path} not exists`);
+      throw new Error(`file ${this.path} not exists`);
     }
 
     if (target instanceof OPFSFileWrap) {
@@ -268,16 +269,18 @@ export class OPFSFileWrap {
 
       await write(target.path, this);
       return file(target.path);
-    } else if (target instanceof OPFSDirWrap) {
+    } else if (target instanceof OPFSDirectoryWrap) {
       return await this.copyTo(file(joinPath(target.path, this.name)));
     }
-    throw Error('Illegal target type');
+    throw new Error('Illegal target type');
   }
 
   /**
    * move file, copy then remove current
    */
-  async moveTo(target: OPFSDirWrap | OPFSFileWrap): Promise<OPFSFileWrap> {
+  async moveTo(
+    target: OPFSDirectoryWrap | OPFSFileWrap
+  ): Promise<OPFSFileWrap> {
     const newFile = await this.copyTo(target);
     await this.remove();
     return newFile;
